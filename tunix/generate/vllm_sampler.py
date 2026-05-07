@@ -397,8 +397,8 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
 
   def __call__(
       self,
-      input_strings: str | List[str],
-      max_generation_steps: int,
+      input_strings: Optional[Union[str, List[str]]] = None,
+      max_generation_steps: int = 0,
       max_prompt_length: int = None,
       temperature: float = 0.0,
       top_p: float = None,
@@ -409,10 +409,20 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
       return_logits: bool = True,
       echo: bool = False,
       pad_output: bool = False,
+      input_token_ids: Optional[List[List[int]]] = None,
       **kwargs,
   ) -> base_sampler.SamplerOutput:
-    """The entry point API for vLLM Sampler"""
-    if isinstance(input_strings, str):
+    """vLLM sampler entry. Pass exactly one of ``input_strings`` (legacy,
+    tokenized internally) or ``input_token_ids`` (TITO mode, fed straight
+    to vLLM via TokensPrompt; preserves byte-equality across multi-turn)."""
+    if (input_strings is None) == (input_token_ids is None):
+      raise ValueError(
+          "Exactly one of `input_strings` or `input_token_ids` must be"
+          " provided (and the other must be None). Received:"
+          f" input_strings={'<set>' if input_strings is not None else None},"
+          f" input_token_ids={'<set>' if input_token_ids is not None else None}."
+      )
+    if input_strings is not None and isinstance(input_strings, str):
       input_strings = [input_strings]
 
     # max_tokens: maximum number of tokens to generate
@@ -488,7 +498,16 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
 
       self.sampling_params = sampling_params
 
-    prompt_ids = [self.tokenize(x) for x in input_strings]
+    if input_token_ids is not None:
+      # TITO mode: caller already has token IDs; skip self.tokenize.
+      prompt_ids = [list(ids) for ids in input_token_ids]
+      # `detokenize` only uses `input_strings` for length-pairing with
+      # `request_outputs`. Provide a same-length list of empty strings
+      # to preserve the zip pairing without affecting decoded outputs.
+      detokenize_input_strings = [""] * len(prompt_ids)
+    else:
+      prompt_ids = [self.tokenize(x) for x in input_strings]
+      detokenize_input_strings = input_strings
     prompt_objects = [TokensPrompt(prompt_token_ids=ids) for ids in prompt_ids]
     if self._driver is not None:
       outputs = self._generate_server_mode(prompt_objects, self.sampling_params)
@@ -499,7 +518,7 @@ class VllmSampler(base_sampler.BaseSampler):  # pylint: disable=invalid-name
           use_tqdm=True,
       )
     decoded_outputs, out_logprobs, out_tokens = self.detokenize(
-        input_strings, outputs
+        detokenize_input_strings, outputs
     )
     if self.config.return_logprobs and (
         out_logprobs is None or out_logprobs[0] is None
