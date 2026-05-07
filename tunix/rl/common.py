@@ -105,6 +105,9 @@ class TrainExample:
   old_per_token_logps: jax.Array | None
   segment_ids: jax.Array | None = None
   segment_positions: jax.Array | None = None
+  # Per-token vLLM rollout logprobs; TIS uses this vs per_token_logps to
+  # correct for trainer/inference engine drift.
+  rollout_log_probs: jax.Array | None = None
 
 
 def compute_kl_divergence(
