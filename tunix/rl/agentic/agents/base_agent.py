@@ -23,12 +23,22 @@ This module defines:
   that maintain conversation history and trajectories. Most concrete agents
   (single-turn, tool-using, gaming, etc.) should subclass this instead of
   `LLMBaseAgent` directly.
+
+* TITO accumulator (`_token_history`): when an agent has TITO enabled
+  (`enable_tito=True`), it maintains a per-episode list of token-id
+  segments — initial prompt, each assistant turn, each env turn —
+  whose concatenation is fed verbatim to vLLM at the next turn. This
+  guarantees byte-equality between rollout-time vLLM input and
+  trainer-time `conversation_tokens`. Mirrors miles
+  `submodules/miles/uda/swe_agent/proxy/tito_state.py:TaskState`.
 """
 
 import abc
 import asyncio
 import copy
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
+
+import numpy as np
 
 from tunix.rl.agentic.agents import agent_types
 
@@ -136,6 +146,126 @@ class ConversationAgentBase(LLMBaseAgent):
     self._init_messages(system_prompt)
     self.step = 0
 
+    # TITO accumulator state (inert until configure_tito is called).
+    self.enable_tito: bool = False
+    self._token_history: list[np.ndarray] = []
+    self._tito_logprob_history: list[np.ndarray] = []
+    self._assistant_prefix_ids: Optional[List[int]] = None
+    self._im_end_token_id: Optional[int] = None
+    self._newline_token_id: Optional[int] = None
+
+  # ---------- TITO support (mirrors miles TaskState) ----------
+
+  def configure_tito(
+      self,
+      *,
+      assistant_prefix_ids: List[int],
+      im_end_token_id: int,
+      newline_token_id: int,
+  ) -> None:
+    """Enable TITO accumulator and seed boundary tokens (im_end, newline,
+    assistant prefix). See plan.md Phase 0/3."""
+    self.enable_tito = True
+    self._assistant_prefix_ids = list(assistant_prefix_ids)
+    self._im_end_token_id = int(im_end_token_id)
+    self._newline_token_id = int(newline_token_id)
+
+  def append_init_tokens(
+      self,
+      prompt_tokens: np.ndarray,
+  ) -> None:
+    """Seed the accumulator with the initial prompt tokens (called by
+    trajectory engine after _reset)."""
+    if not self.enable_tito:
+      return
+    arr = np.asarray(prompt_tokens, dtype=np.int32)
+    self._token_history.append(arr)
+    self._tito_logprob_history.append(
+        np.zeros(arr.shape[0], dtype=np.float32)
+    )
+
+  def append_assistant_response(
+      self,
+      content_tokens: np.ndarray,
+      content_logprobs: Optional[np.ndarray] = None,
+  ) -> None:
+    """Append assistant turn with miles-style suffix wrap [im_end, newline].
+    Defensively strips trailing eos. content_logprobs may be None for
+    legacy callers; suffix positions get 0.0 logprob."""
+    if not self.enable_tito:
+      return
+    if self._im_end_token_id is None or self._newline_token_id is None:
+      raise RuntimeError(
+          "TITO is enabled but boundary-token constants are not set;"
+          " call configure_tito(...) first."
+      )
+    content_tokens = np.asarray(content_tokens, dtype=np.int32)
+    if content_logprobs is None:
+      content_logprobs = np.zeros(content_tokens.shape[0], dtype=np.float32)
+    else:
+      content_logprobs = np.asarray(content_logprobs, dtype=np.float32)
+    if content_tokens.shape[0] != content_logprobs.shape[0]:
+      raise ValueError(
+          f"content_tokens length ({content_tokens.shape[0]}) does not"
+          f" match content_logprobs length ({content_logprobs.shape[0]})"
+      )
+
+    # Defensive eos strip (matches miles tito_state.py:34-46).
+    if (
+        content_tokens.shape[0] > 0
+        and int(content_tokens[-1]) == self._im_end_token_id
+    ):
+      content_tokens = content_tokens[:-1]
+      content_logprobs = content_logprobs[:-1]
+
+    suffix_ids = np.array(
+        [self._im_end_token_id, self._newline_token_id], dtype=np.int32
+    )
+    suffix_logprobs = np.zeros(suffix_ids.shape[0], dtype=np.float32)
+
+    wrapped = np.concatenate([content_tokens, suffix_ids])
+    wrapped_logprobs = np.concatenate([content_logprobs, suffix_logprobs])
+    self._token_history.append(wrapped)
+    self._tito_logprob_history.append(wrapped_logprobs)
+
+  def append_env_observation_tokens(
+      self,
+      env_tokens: np.ndarray,
+  ) -> None:
+    """Append env observation tokens. Drops leading newline if prior
+    segment already ends in newline (avoids double-newline at the role
+    boundary; preserves byte-equality with apply_chat_template)."""
+    if not self.enable_tito:
+      return
+    arr = np.asarray(env_tokens, dtype=np.int32)
+    if (
+        arr.shape[0] > 0
+        and self._newline_token_id is not None
+        and int(arr[0]) == self._newline_token_id
+        and self._token_history
+        and self._token_history[-1].shape[0] > 0
+        and int(self._token_history[-1][-1]) == self._newline_token_id
+    ):
+      arr = arr[1:]
+    self._token_history.append(arr)
+    self._tito_logprob_history.append(
+        np.zeros(arr.shape[0], dtype=np.float32)
+    )
+
+  @property
+  def token_prompt_for_next_turn(self) -> List[int]:
+    """Concatenated TITO token-id stream (Python ints) for the next vLLM call."""
+    if not self._token_history:
+      return []
+    return np.concatenate(self._token_history).astype(np.int32).tolist()
+
+  @property
+  def all_logprobs(self) -> np.ndarray:
+    """Rollout logprobs aligned with token_prompt_for_next_turn (float32, zero at non-content positions)."""
+    if not self._tito_logprob_history:
+      return np.zeros(0, dtype=np.float32)
+    return np.concatenate(self._tito_logprob_history).astype(np.float32)
+
   # ---------- Internal helpers ----------
 
   def _init_messages(self, system_prompt: str) -> None:
@@ -221,7 +351,11 @@ class ConversationAgentBase(LLMBaseAgent):
       self._observation_to_messages(observation, reward, done, info)
 
   def reset(self) -> None:
-    """Reset trajectory, cache, and conversation history."""
+    """Reset trajectory, cache, conversation history, and TITO accumulator."""
     self._trajectory = agent_types.Trajectory()
     self._init_messages(self.system_prompt)
     self.step = 0
+    # Preserve TITO config (enable_tito + constants) across episodes;
+    # only the per-episode segment lists are cleared.
+    self._token_history = []
+    self._tito_logprob_history = []
