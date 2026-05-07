@@ -43,6 +43,18 @@ class TrainExample(common.TrainExample):
 
 
 @dataclasses.dataclass(kw_only=True)
+class TisConfig:
+  """Token Importance Sampling. When use_tis=True, pg_loss is multiplied
+  per-token by clip(exp(per_token_logps - rollout_log_probs), low, high)
+  to correct vLLM/JAX engine drift. Defaults match miles."""
+
+  use_tis: bool = False
+  tis_clip_low: float = 0.1
+  tis_clip_high: float = 10.0
+  tis_level: str = "token"
+
+
+@dataclasses.dataclass(kw_only=True)
 class GRPOConfig(algo_config_lib.AlgorithmConfig):
   """Configuration for GRPO algorithms.
 
@@ -68,6 +80,7 @@ class GRPOConfig(algo_config_lib.AlgorithmConfig):
     loss_algo: use GRPO or GSPO for loss computation. GRPO loss is per-batch
       normalized instead of per-response normalized as mentioned in the paper.
       For GSPO, we use gspo-token loss which is more flexible.
+    tis_config: TIS configuration. Default: disabled.
 
   References:
     - GRPO: https://arxiv.org/abs/2402.03300
@@ -89,6 +102,7 @@ class GRPOConfig(algo_config_lib.AlgorithmConfig):
   num_iterations: int = 1
   beta: float = 0.04
   epsilon: float = 0.2
+  tis_config: TisConfig = dataclasses.field(default_factory=TisConfig)
 
   def __post_init__(self):
     if self.num_generations <= 1:
@@ -101,6 +115,18 @@ class GRPOConfig(algo_config_lib.AlgorithmConfig):
       raise ValueError(
           "loss_algo should be either grpo or gspo-token. Received: "
           f"{self.loss_algo}"
+      )
+
+    if self.tis_config.tis_level != "token":
+      raise ValueError(
+          "Only tis_level='token' supported in v1; got"
+          f" {self.tis_config.tis_level!r}"
+      )
+    if self.tis_config.tis_clip_low >= self.tis_config.tis_clip_high:
+      raise ValueError(
+          "tis_clip_low must be < tis_clip_high; got"
+          f" low={self.tis_config.tis_clip_low}"
+          f" high={self.tis_config.tis_clip_high}"
       )
 
 
@@ -565,6 +591,32 @@ def grpo_loss_fn(
       "kl": mean_kl,
       "pg_clipfrac": pg_clipfrac,
   }
+
+  # TIS: per-token loss multiplier; weight is detached from gradient
+  # (stop_gradient on per_token_logps) so correction does not flow into policy.
+  tis_config = getattr(algo_config, "tis_config", None)
+  if (
+      tis_config is not None
+      and getattr(tis_config, "use_tis", False)
+      and getattr(train_example, "rollout_log_probs", None) is not None
+  ):
+    tis_log_ratio = (
+        jax.lax.stop_gradient(per_token_logps) - train_example.rollout_log_probs
+    )
+    tis = jnp.exp(tis_log_ratio)
+    tis_weights = jnp.clip(
+        tis, tis_config.tis_clip_low, tis_config.tis_clip_high
+    )
+    per_token_loss = per_token_loss * tis_weights
+
+    mask_sum = jnp.clip(jnp.sum(completion_mask), min=1)
+    aux["tis_mean"] = jnp.sum(tis * completion_mask) / mask_sum
+    aux["tis_clipfrac"] = jnp.sum(
+        ((tis_weights != tis) * completion_mask).astype(jnp.float32)
+    ) / mask_sum
+    aux["tis_abs_mean"] = jnp.sum(
+        jnp.abs(tis - 1.0) * completion_mask
+    ) / mask_sum
 
   loss = common.aggregate_loss(
       per_token_loss, completion_mask, loss_aggregation_mode
