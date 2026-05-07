@@ -86,13 +86,21 @@ class VllmRollout(base_rollout.BaseRollout):
 
   def generate(
       self,
-      prompts: list[str],
-      rollout_config: base_rollout.RolloutConfig,
+      prompts: list[str] | None = None,
+      rollout_config: base_rollout.RolloutConfig = None,
+      *,
+      prompt_token_ids: list[list[int]] | None = None,
       **kwargs,
   ) -> base_rollout.RolloutOutput:
-    """Generates samples from the model."""
+    """Generates samples. Pass exactly one of ``prompts`` (legacy strings)
+    or ``prompt_token_ids`` (TITO mode, bypasses sampler tokenize)."""
+    if (prompts is None) == (prompt_token_ids is None):
+      raise ValueError(
+          "Exactly one of `prompts` or `prompt_token_ids` must be provided."
+      )
     self.output = self._sampler(
         input_strings=prompts,
+        input_token_ids=prompt_token_ids,
         max_generation_steps=rollout_config.max_tokens_to_generate,
         max_prompt_length=rollout_config.max_prompt_length,
         temperature=rollout_config.temperature,
