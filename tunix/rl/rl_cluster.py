@@ -845,47 +845,48 @@ class RLCluster:
 
   def generate(
       self,
-      prompts: list[str] | list[list[dict[str, str]]],
+      prompts: list[str] | list[list[dict[str, str]]] | None = None,
       apply_chat_template: bool = False,
       mode: Mode = Mode.TRAIN,
       micro_batch_size: int | None = None,
       trace_tags: Mapping[str, Any] | None = None,
       max_generation_steps: int | None = None,
+      *,
+      prompt_token_ids: list[list[int]] | None = None,
   ) -> base_rollout.RolloutOutput:
-    """Generates text from the given prompts.
-
-    Args:
-      prompts: A list of prompts to generate text from. If `apply_chat_template`
-        is True, this should be a list of conversations (each a list of
-        dictionaries with 'role' and 'content'). Otherwise, it should be a list
-        of strings.
-      apply_chat_template: Whether to apply chat template to the prompts.
-      mode: The mode of rollout, either TRAIN or EVAL.
-      micro_batch_size: The micro-batch size for generation. If None, no
-        micro-batching is performed.
-      trace_tags: Optional tags to add to the performance tracer.
-
-    Returns:
-      A `RolloutOutput` object containing the generated text and other info.
-    """
-    if apply_chat_template:
-      if self.tokenizer is None:
-        raise ValueError("Tokenizer must be initialized to use chat templates.")
-      string_prompts = [
-          self.tokenizer.apply_chat_template(
-              prompt,  # pytype: disable=wrong-arg-types
-              add_generation_prompt=True,
-              tokenize=False,
-              enable_thinking=False,
-          )
-          for prompt in prompts
-      ]
+    """Generates text from prompts. Pass exactly one of ``prompts`` (legacy
+    strings or chat-completions when ``apply_chat_template=True``) or
+    ``prompt_token_ids`` (TITO mode, pre-tokenized; bypasses both the
+    chat-template render and sampler tokenize)."""
+    if (prompts is None) == (prompt_token_ids is None):
+      raise ValueError(
+          "Exactly one of `prompts` or `prompt_token_ids` must be provided."
+      )
+    if prompt_token_ids is not None:
+      string_prompts = None
+      n_prompts = len(prompt_token_ids)
     else:
-      string_prompts = prompts  # pytype: disable=annotation-type-mismatch
+      if apply_chat_template:
+        if self.tokenizer is None:
+          raise ValueError(
+              "Tokenizer must be initialized to use chat templates."
+          )
+        string_prompts = [
+            self.tokenizer.apply_chat_template(
+                prompt,  # pytype: disable=wrong-arg-types
+                add_generation_prompt=True,
+                tokenize=False,
+                enable_thinking=False,
+            )
+            for prompt in prompts
+        ]
+      else:
+        string_prompts = prompts  # pytype: disable=annotation-type-mismatch
+      n_prompts = len(string_prompts)
 
-    if len(string_prompts) == 0:
+    if n_prompts == 0:
       raise ValueError("Cannot generate from an empty list of prompts.")
-    micro_batch_size = micro_batch_size or len(string_prompts)
+    micro_batch_size = micro_batch_size or n_prompts
 
     with self._get_mesh_and_logical_axis_rules_cm(Role.ROLLOUT) as (mesh, _):
       model = self.rollout.model()
@@ -915,12 +916,23 @@ class RLCluster:
           mesh.devices,
           tags=perf_tags,
       ) as span_v2:
-        outputs = [
-            self.rollout.generate(string_prompts[s], rollout_config)
-            for s in rl_utils.chunk_slices_by_size(
-                stop=len(string_prompts), step=micro_batch_size
-            )
-        ]
+        if prompt_token_ids is not None:
+          outputs = [
+              self.rollout.generate(
+                  rollout_config=rollout_config,
+                  prompt_token_ids=prompt_token_ids[s],
+              )
+              for s in rl_utils.chunk_slices_by_size(
+                  stop=n_prompts, step=micro_batch_size
+              )
+          ]
+        else:
+          outputs = [
+              self.rollout.generate(string_prompts[s], rollout_config)
+              for s in rl_utils.chunk_slices_by_size(
+                  stop=n_prompts, step=micro_batch_size
+              )
+          ]
         span.device_end([o.tokens for o in outputs])
         span_v2.async_end([o.tokens for o in outputs])
       self._maybe_offload_model_to_cpu(model, Role.ROLLOUT)
