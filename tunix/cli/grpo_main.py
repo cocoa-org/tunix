@@ -812,7 +812,69 @@ def _setup_pathways_on_cloud():
   pathwaysutils.initialize()
 
 
+def _reset_sigsegv_handler_after_imports() -> None:
+  """SIGSEGV mitigation (Phase 7 V1.5 verdict).
+
+  Some library imported by tunix or its JAX/tpu-inference stack installs
+  a SIGSEGV handler during import that corrupts PyFrameObject memory
+  under load (presents as Python frame line numbers >2 billion in
+  faulthandler tracebacks at +3-4 min into training). V1.5 found that
+  re-installing the SIGSEGV handler AFTER all imports complete reliably
+  prevents the crash.
+
+  Mechanism:
+    1. If env var ``TUNIX_SEGV_CATCHER_SO`` points to a built copy of
+       ``examples/tinyflow_swe/scripts/segv_catcher.so``, we use its
+       ``segv_catcher_reinstall`` exported function (best — captures
+       binary dumps if anything still fires).
+    2. Else, fall back to ``faulthandler.disable() + faulthandler.enable()``
+       which forces sigaction(SIGSEGV, ...) again with Python's clean
+       handler, overriding whatever buggy handler may have been
+       installed during import.
+
+  Either path resets the SIGSEGV handler. Either is sufficient to prevent
+  the V1.5-class crash. The C-library path is preferred only when active
+  debug-dump capture is desired.
+
+  RELATED MITIGATION (not handled here): wandb 0.26.x's ``wandb-xpu``
+  Rust subprocess has a separate tokio Drop UAF that fires
+  ``tokio-rt-worker[...]: segfault at ...6e6c0`` at process teardown.
+  To prevent that, set ``WANDB_MODE=disabled`` (and optionally
+  ``WANDB__DISABLE_SERVICE=true``, ``WANDB_DISABLE_SERVICE=true``) in
+  your launch script's environment BEFORE ``import wandb`` happens.
+  We do NOT set those automatically here so the user retains explicit
+  control over whether wandb runs.
+
+  See tasks/debug_tokio/plan.md Phase 7 V1.5 review.
+  """
+  segv_so = os.environ.get("TUNIX_SEGV_CATCHER_SO")
+  if segv_so and os.path.exists(segv_so):
+    try:
+      import ctypes  # local import — only used if env opts in
+      ctypes.CDLL(segv_so).segv_catcher_reinstall()
+      logging.info("[tunix-segv-mitigation] segv_catcher reinstalled "
+                   "from %s", segv_so)
+      return
+    except Exception as e:  # noqa: BLE001 — best-effort reinstall
+      logging.warning("[tunix-segv-mitigation] segv_catcher_reinstall "
+                      "failed: %s; falling back to faulthandler reset", e)
+  try:
+    import faulthandler
+    faulthandler.disable()
+    faulthandler.enable()
+    logging.info("[tunix-segv-mitigation] faulthandler disable+enable "
+                 "cycle — SIGSEGV handler reset")
+  except Exception as e:  # noqa: BLE001 — best-effort reinstall
+    logging.warning("[tunix-segv-mitigation] faulthandler reset failed: "
+                    "%s; SIGSEGV handler may be in a bad state", e)
+
+
 def main(argv, **kwargs):
+  # SIGSEGV mitigation: reset the handler now that all tunix/JAX imports
+  # have run. See _reset_sigsegv_handler_after_imports docstring +
+  # tasks/debug_tokio/plan.md Phase 7 V1.5.
+  _reset_sigsegv_handler_after_imports()
+
   if _PATHWAYS_BNS.value:
     _setup_jax_pathways(_PATHWAYS_BNS.value)
 
