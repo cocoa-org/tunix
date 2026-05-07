@@ -390,17 +390,15 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       chat_lists: List[Dict[str, str]],
       env: Any = None,
       max_generation_steps: int | None = None,
+      *,
+      prompt_token_ids: list[list[int]] | None = None,
   ) -> base_rollout.RolloutOutput:
-    """Calls model generation."""
+    """Calls model generation. Pass either ``chat_lists`` (legacy; chat_parser
+    renders to string) or ``prompt_token_ids`` (TITO; bypasses chat_parser
+    and forwards token IDs to vllm_sampler)."""
     if env:
       env.task["policy_version"] = self.policy_version
 
-    if self.chat_parser:
-      chat_lists = self.chat_parser.parse(
-          messages=chat_lists,
-          add_generation_prompt=True,
-          is_first_msg=True,  # no op if system msg is populated in reset
-      )
     tags = {}
     if env and hasattr(env, "extra_kwargs"):
       if "group_id" in env.extra_kwargs:
@@ -412,7 +410,19 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
       if "pair_index" in env.extra_kwargs:
         tags[perf_constants.PAIR_INDEX] = env.extra_kwargs["pair_index"]
 
+    if prompt_token_ids is not None:
+      return self.rl_cluster.generate(
+          prompt_token_ids=prompt_token_ids,
+          mode=rl_cluster_lib.Mode.TRAIN,
+          trace_tags=tags,
+      )
 
+    if self.chat_parser:
+      chat_lists = self.chat_parser.parse(
+          messages=chat_lists,
+          add_generation_prompt=True,
+          is_first_msg=True,  # no op if system msg is populated in reset
+      )
 
     result = self.rl_cluster.generate(
         prompts=chat_lists,
