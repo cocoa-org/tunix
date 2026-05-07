@@ -20,6 +20,7 @@ an LLM-based agent and an environment. It supports single and concurrent
 multi-pair trajectory collection.
 """
 import asyncio
+import functools
 import json
 import time
 from typing import Any, AsyncGenerator, Callable, Concatenate, Dict, List, Optional, ParamSpec, Set, Tuple
@@ -436,6 +437,9 @@ class TrajectoryCollectEngine:
           contains_generation_msg=True,
       )
       self.agent.trajectory.prompt_tokens = prompt_tokens
+      # Seed the TITO accumulator. Inert no-op when ``enable_tito`` is False.
+      if hasattr(self.agent, "append_init_tokens"):
+        self.agent.append_init_tokens(np.asarray(prompt_tokens, dtype=np.int32))
 
     self._start_ts = time.perf_counter()
     self._response_token_count = 0
@@ -500,8 +504,24 @@ class TrajectoryCollectEngine:
     )
     logging.debug("%s model_call starting", self._debug_prefix)
 
+    # TITO branch: when the agent has a populated token accumulator, feed
+    # vLLM the pre-tokenized prompt instead of letting downstream layers
+    # apply_chat_template + re-tokenize.
+    use_tito = (
+        getattr(self.agent, "enable_tito", False)
+        and bool(getattr(self.agent, "_token_history", None))
+    )
+
     def _safe_model_call():
       try:
+        if use_tito:
+          return self.model_call(
+              None,  # chat_lists unused in TITO mode
+              self.env,
+              prompt_token_ids=[self.agent.token_prompt_for_next_turn],
+              max_generation_steps=max_generation_steps,
+              **self.model_call_kwargs,
+          )
         return self.model_call(
             self.agent.chat_completions,
             self.env,
@@ -517,6 +537,7 @@ class TrajectoryCollectEngine:
         _safe_model_call,
     )
     logging.debug("%s model_call done", self._debug_prefix)
+
 
     if rollout_output.tokens:
       self._response_token_count += len(rollout_output.tokens[0])
@@ -604,6 +625,13 @@ class TrajectoryCollectEngine:
       if assistant_message:
         cur_step.assistant_tokens = rollout_output.tokens[0]
         cur_step.assistant_masks = np.ones_like(rollout_output.tokens[0])
+        # TITO accumulator: append wrapped assistant content (no-op if
+        # enable_tito=False).
+        if hasattr(self.agent, "append_assistant_response"):
+          self.agent.append_assistant_response(
+              rollout_output.tokens[0],
+              rollout_output.logprobs[0] if rollout_output.logprobs else None,
+          )
 
       # Environment tokens/masks
       # Terminal-step environment messages are not appended to the response
@@ -619,6 +647,9 @@ class TrajectoryCollectEngine:
         cur_step.env_tokens = np.array(e_tokens)
         cur_step.env_masks = np.array(e_masks)
         self._response_token_count += len(e_tokens)
+        # TITO accumulator: append env tokens verbatim.
+        if hasattr(self.agent, "append_env_observation_tokens"):
+          self.agent.append_env_observation_tokens(np.array(e_tokens))
 
     if step_timed_out:
       self.agent.trajectory.status = agent_types.TrajectoryStatus.TIMEOUT
