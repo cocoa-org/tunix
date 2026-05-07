@@ -546,6 +546,11 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
           user_defined_metric, mode=mode, step=expected_step
       )
 
+    # TIS plumb: forward rollout-time logprobs to TrainExample; consumed
+    # by grpo_learner.policy_loss_fn when tis_config.use_tis is set.
+    rollout_log_probs = (
+        old_per_token_logps if old_per_token_logps is not None else None
+    )
     combined_batch = TrainExample(
         prompt_ids=prompt_ids,
         prompt_mask=prompt_mask,
@@ -554,6 +559,7 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
         ref_per_token_logps=ref_per_token_logps,
         advantages=advantages,
         old_per_token_logps=old_per_token_logps,
+        rollout_log_probs=rollout_log_probs,
         policy_version=policy_versions,
     )
     return [combined_batch]
