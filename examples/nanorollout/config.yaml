@@ -1,0 +1,200 @@
+# NanoRollout demo — Qwen3-4B SWE-RL agentic GRPO, v5p-8.
+#
+# Migration of examples/tinyflow_swe configs (base + a4_phase9 override) into a
+# single self-contained yaml. Drops all TODO(skyrl-feat) annotations; keeps
+# only what the demo actually runs.
+#
+# Use as: tunix.cli.grpo_main config.yaml [k=v ...]
+
+############################## MODEL ##############################
+model_config: &base_model_config
+  model_name: "Qwen3-4B-Instruct-2507"
+  model_source: "huggingface"
+  model_id: "Qwen/Qwen3-4B-Instruct-2507"
+  model_path: ""
+  model_download_path: "/mnt/disks/tunix-data/hf"
+  rng_seed: 42
+  model_display: false
+  intermediate_ckpt_dir: "/mnt/disks/tunix-data/intermediate_ckpt/"
+  use_flash_attention: false
+  flash_attention_block_size: 1024
+  lora_config: {}
+  remat_config: 3
+  mesh:
+    shape: "(2,2)"
+    axis_names: "('fsdp','tp')"
+
+actor_model_config:
+  <<: *base_model_config
+
+reference_model_config:
+  <<: *base_model_config
+  mesh: null
+  same_mesh_as: "actor"
+
+rollout_model_config:
+  <<: *base_model_config
+  mesh: null
+  same_mesh_as: "actor"
+
+############################## TOKENIZER ##############################
+tokenizer_config:
+  tokenizer_path: "Qwen/Qwen3-4B-Instruct-2507"
+  tokenizer_type: "huggingface"
+  add_bos: false
+  add_eos: false
+
+############################## DATA ##############################
+data_source: ""
+data_directory: ""
+data_module: "examples.nanorollout.nanorollout_data"
+apply_chat_template_to_dataset: false
+data_config:
+  dataset_name: "SWE-Gym/SWE-Gym"
+  dataset_split: "train"
+  filter_jsonl_path: "/home/yuxuan/tunix/submodules/test_nanorollout_tunix/trainers/tunix/examples/nanorollout/swegym_samples.jsonl"
+  cache_dir: "/mnt/disks/tunix-data/dataset_cache"
+  shuffle: true
+  seed: 42
+dataset_name: "SWE-Gym/SWE-Gym"
+prompt_key: "problem_statement"
+batch_size: 1
+max_target_length: 256
+num_train_epochs: 1
+train_fraction: 1.0
+num_test_batches: 100
+tfds_download: false
+num_batches: 10
+
+############################## OPTIMIZER ##############################
+optimizer_config: &base_optimizer_config
+  learning_rate: 1e-6
+  opt_type: "adamw"
+  schedule_type: "cosine_decay_schedule"
+  value: 1e-6
+  peak_value: 1e-6
+  init_value: 1e-6
+  end_value: 0.0
+  warmup_ratio: 0.1
+  b1: 0.9
+  b2: 0.99
+  weight_decay: 0.1
+  warmup_steps: 20
+  decay_steps: 200
+  max_grad_norm: 0.1
+
+############################## RL TRAINING ##############################
+training_config: &base_training_config
+  eval_every_n_steps: 999
+  max_steps: 10
+  # gradient_accumulation_steps left unset (None) for RL — tunix derives it
+  # automatically from mini_batch_size // train_micro_batch_size. Explicit
+  # int triggers ValueError("For RL training, ... should be None") at
+  # config.py.
+  gradient_accumulation_steps: null
+  checkpoint_root_directory: "/mnt/disks/tunix-data/checkpoints/nro_demo"
+  checkpointing_options:
+    max_to_keep: 2
+    save_interval_steps: 1
+  metrics_logging_options:
+    project_name: "tunix"
+    run_name: ""
+    log_dir: "/mnt/disks/tunix-data/tb_logs/nro_demo"
+    flush_every_n_steps: 5
+  perf_metrics_options: {}
+  profiler_options:
+    log_dir: "/mnt/disks/tunix-data/profiling/nro_demo"
+    skip_first_n_steps: 1
+    profiler_steps: 9
+  data_sharding_axis: ["fsdp"]
+  max_inflight_computations: 2
+
+rl_training_config:
+  <<: *base_training_config
+  actor_optimizer_config:
+    <<: *base_optimizer_config
+  critic_optimizer_config: null
+  mini_batch_size: 1
+  train_micro_batch_size: 1
+  rollout_micro_batch_size: 1
+  compute_logps_micro_batch_size: 1
+
+############################## GRPO (legacy non-agentic parser) ##############################
+grpo_config:
+  num_generations: 2
+  num_iterations: 1
+  beta: 0.001
+  epsilon: 0.2
+
+############################## ROLLOUT ##############################
+rollout_config:
+  total_generation_steps: 2048
+  max_prompt_length: 4096
+  max_tokens_to_generate: 2048
+  temperature: 1.0
+  top_p: null
+  top_k: null
+  return_logprobs: true
+
+rollout_engine: "vllm"
+sglang_jax_config: {}
+vllm_config:
+  hbm_utilization: 0.4
+  tpu_backend_type: "jax"
+  server_mode: true
+  async_scheduling: true
+  max_num_seqs: 4
+  kwargs:
+    kv_cache_metrics: true
+    disable_log_stats: false
+    enable_prefix_caching: true
+
+offload_to_cpu: false
+
+############################## AGENTIC ##############################
+training_mode: "agentic_grpo"
+
+chat_parser_config:
+  type: "qwen"
+
+agent_class_path: "examples.nanorollout.nanorollout_agent.NanoRolloutOhCoreAgent"
+agent_kwargs:
+  tokenizer_path: "Qwen/Qwen3-4B-Instruct-2507"
+  workspace_dir: "/testbed"
+  enable_tito: false
+
+env_class_path: "examples.nanorollout.nanorollout_env.NanoRolloutGCEEnv"
+env_kwargs:
+  max_steps: 10
+  mig_name: "tunix-worker-mig"
+  gcp_project: "hao-ai-lab-trc"
+  gcp_zone: "us-west1-a"
+  workspace_dir: "/testbed"
+  step_timeout: 120
+  eval_timeout: 600
+
+kubernetes_config: null
+
+agentic_grpo_config:
+  max_turns: 10
+  per_turn_timeout_secs: 300
+  context_ratio: 2
+  max_concurrency: 4
+  num_generations: 2
+  max_response_length: 2048
+  num_iterations: 1
+  beta: 0.001
+  epsilon: 0.2
+  epsilon_high: 0.28
+  off_policy_steps: 0
+  loss_agg_mode: "sequence-mean-token-mean"
+  kl_loss_mode: "low_var_kl"
+  tis_config:
+    use_tis: false
+    tis_clip_low: 0.1
+    tis_clip_high: 10.0
+    tis_level: "token"
+
+############################## REWARD ##############################
+verl_compatible: false
+reward_functions: []
